@@ -41,6 +41,41 @@ def _generate_unique_h2_file_path():
     return f"./target/h2-test-{uuid.uuid4()}/eda_ha"
 
 
+def _assert_row_backed_session_without_partial_blob(
+    db_params, ha_uuid, rule_set_name=None
+):
+    count_sql = (
+        "SELECT COUNT(*) FROM drools_ansible_session_state WHERE ha_uuid = ?"
+    )
+    blob_sql = "SELECT partial_matching_events FROM "
+    blob_sql += "drools_ansible_session_state WHERE ha_uuid = ?"
+    event_record_sql = (
+        "SELECT COUNT(*) FROM drools_ansible_event_record WHERE ha_uuid = ?"
+    )
+    params = [ha_uuid]
+
+    if rule_set_name is not None:
+        count_sql += " AND rule_set_name = ?"
+        blob_sql += " AND rule_set_name = ?"
+        event_record_sql += " AND rule_set_name = ?"
+        params.append(rule_set_name)
+
+    session_row_count = query_raw_column(db_params, count_sql, *params)
+    assert session_row_count == "1", "session_state row should exist"
+
+    raw_partial_events = query_raw_column(db_params, blob_sql, *params)
+    assert raw_partial_events is None, (
+        "partial_matching_events should remain NULL for row-backed "
+        + "sessions with no retained partial events"
+    )
+
+    event_record_count = query_raw_column(db_params, event_record_sql, *params)
+    assert event_record_count == "0", (
+        "drools_ansible_event_record should stay empty when the ruleset "
+        + "does not retain partial events"
+    )
+
+
 @pytest.fixture
 def db_params():
     """DB connection parameters for testing"""
@@ -1241,20 +1276,10 @@ async def test_ha_encryption_failover(db_params):
         ), f"event_data should be encrypted, got: {raw_event_data[:50]}"
         print(f"Verified: event_data is encrypted {raw_event_data[:30]}...")
 
-        raw_session_state = query_raw_column(
-            db_params,
-            "SELECT partial_matching_events FROM "
-            "drools_ansible_session_state WHERE ha_uuid = ?",
-            ha_uuid,
-        )
-        assert raw_session_state is not None, "session_state row should exist"
-        assert raw_session_state.startswith("$ENCRYPTED$"), (
-            f"partial_matching_events should be encrypted, "
-            f"got: {raw_session_state[:50]}"
-        )
+        _assert_row_backed_session_without_partial_blob(db_params, ha_uuid)
         print(
-            "Verified: session_state is encrypted "
-            f"({raw_session_state[:30]}...)"
+            "Verified: session_state row exists and "
+            + "partial_matching_events remains NULL for row-backed state"
         )
 
     print("RulesetCollection shut down")
@@ -1294,6 +1319,63 @@ async def test_ha_encryption_failover(db_params):
     # Final cleanup
     if RulesetCollection.engine is not None:
         shutdown()
+
+    # --- Partial-match path: retained EventRecord rows should be encrypted ---
+    partial_ha_uuid = str(uuid.uuid4())
+    partial_test_data = load_ast(
+        "asts/rules_with_multiple_conditions_all_assignment.yml"
+    )
+    partial_ruleset_data = partial_test_data[0]["RuleSet"]
+    partial_captured_matches = []
+
+    async with ha_worker_manager(
+        partial_ha_uuid,
+        "worker-partial",
+        db_params,
+        enc_ha_config,
+        partial_ruleset_data,
+        "multiple conditions",
+        partial_captured_matches,
+        shutdown_on_exit=True,
+    ) as ctx:
+        rs_partial = ctx["ruleset"]
+        my_partial_callback = ctx["callback"]
+
+        rs_partial.assert_event(json.dumps({"i": 0}))
+        await wait_for_async_processing(0.5)
+
+        assert_rule_not_fired(
+            my_partial_callback,
+            partial_captured_matches,
+            "Rule should not fire with only one condition matched",
+        )
+
+        raw_event_record = query_raw_column(
+            db_params,
+            "SELECT event_json FROM drools_ansible_event_record "
+            + "WHERE ha_uuid = ? AND rule_set_name = ?",
+            partial_ha_uuid,
+            partial_ruleset_data["name"],
+        )
+        assert raw_event_record is not None, "event_record row should exist"
+        assert raw_event_record.startswith(
+            "$ENCRYPTED$"
+        ), f"event_json should be encrypted, got: {raw_event_record[:50]}"
+        assert '{"i":0}' not in raw_event_record
+        assert '{"i": 0}' not in raw_event_record
+
+        raw_partial_events = query_raw_column(
+            db_params,
+            "SELECT partial_matching_events FROM "
+            + "drools_ansible_session_state "
+            + "WHERE ha_uuid = ? AND rule_set_name = ?",
+            partial_ha_uuid,
+            partial_ruleset_data["name"],
+        )
+        assert raw_partial_events is None, (
+            "partial_matching_events should remain NULL for row-backed "
+            + "retained partial events"
+        )
 
 
 @pytest.mark.asyncio
@@ -1412,42 +1494,15 @@ async def test_ha_key_rotation_with_restart(db_params):
         await wait_for_async_processing(0.5)
 
         # Verify session state is re-encrypted with new key
-        raw_session_state = query_raw_column(
+        _assert_row_backed_session_without_partial_blob(
             db_params,
-            "SELECT partial_matching_events FROM "
-            "drools_ansible_session_state WHERE ha_uuid = ? "
-            "AND rule_set_name = ?",
             ha_uuid,
             ruleset_data["name"],
         )
-        assert (
-            raw_session_state is not None
-        ), "session_state row should exist after re-encryption"
-        assert raw_session_state.startswith("$ENCRYPTED$"), (
-            f"session_state should be encrypted, got: "
-            f"{raw_session_state[:50]}"
-        )
         print(
-            "Verified: session_state is encrypted "
-            f"({raw_session_state[:30]}...)"
+            "Verified: session_state row exists after restart and "
+            + "partial_matching_events remains NULL for row-backed state"
         )
-
-        # Decrypt with only the new key (no secondary) to confirm
-        # re-encryption used the new primary key
-        import jpy
-
-        ha_encryption = jpy.get_type(
-            "org.drools.ansible.rulebook.integration.ha.api.HAEncryption"
-        )
-        rotated_only = ha_encryption(new_key, None)
-        decrypt_result = rotated_only.decrypt(raw_session_state)
-        assert (
-            not decrypt_result.usedSecondaryKey()
-        ), "Should decrypt with primary (new) key, not secondary"
-        assert (
-            decrypt_result.plaintext() is not None
-        ), "Decrypted session state should not be None"
-        print("Verified: session state re-encrypted with new primary key")
 
     # Final cleanup
     if RulesetCollection.engine is not None:
